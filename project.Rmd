@@ -1,0 +1,965 @@
+---
+title: "Group15! BlueBike Analysis"
+output: github_document
+date: "2025-12-10"
+---
+
+# Introduction and Motivation
+
+BlueBikes is one of Boston’s largest public bike-share systems, with stations spread across Boston, Cambridge, Brookline, and nearby neighborhoods. As frequent users, we’ve all run into the same practical frustrations: arriving at an empty station when we need a bike, reaching a full station when trying to dock, or taking longer routes because nearby stations are oddly spaced. These small problems suggest a bigger question — is there an underlying pattern to how BlueBikes stations are placed and used across the city?
+
+In this project, we use one year of BlueBikes trip data and the corresponding station list to explore how usage varies across time, location, rider type, and bike type. Our main goals are to understand:\
+1. How do station locations (such as population density, proximity to colleges, and nearby commercial areas) relate to BlueBikes stations running empty or full, and what can patterns in start/end-times tell us about when and where congestion occurs?\
+2. How seasonal trends affect the system, such as expected winter drops or summer peaks.\
+3. How distance and trip duration relate, especially because BlueBikes charges overtime fees after a threshold; stations with many long-duration trips may indicate gaps where an intermediate station could reduce overage charges.\
+4. Whether there is a correlation between membership type (member vs. casual) and bike type (classic vs. electric).
+
+Beyond understanding the system, our findings may help identify places where additional stations, better spacing, or policy changes could improve the user experience. For instance, if we find strong patterns around universities such as Boston University, it may support advocacy for student-focused partnerships or discounted plans. Similarly, evidence of long-haul trips caused by poor station spacing could support proposals for intermediate stations or adjusted overtime policies.
+
+To investigate these questions, we collect and clean BlueBikes system data from the Boston open data portal, perform exploratory analyses on temporal and spatial trends, and build statistical models to quantify relationships between demand, location, season, and station characteristics. Our goal is to produce both practical insights and a foundation for future planning recommendations.
+
+```{r imports_setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(arrow)
+library(here)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(stringr)
+library(tmap)
+library(biscale)
+library(ggplot2)
+library(cowplot) # for combining map + legend
+library(patchwork)
+library(vcd)
+library(tibble)
+library(spdep)
+library(spatialreg)
+```
+
+# Data Collection and Cleaning
+
+We obtained one full year of trip data from the Bluebikes “System Data” portal (https://bluebikes.com/system-data), which publishes monthly ride history files as CSVs (https://s3.amazonaws.com/hubway-data/index.html). For each month from October 2024 through October 2025, we downloaded the corresponding \*-bluebikes-tripdata.csv files converted them to Parquet format as shown above to allow us a more efficient analysis for large datasets. We also looked at a list of the BlueBikes stations found on the same page. 
+
+For a general data cleaning, we removed all NA values. We also removed ride IDs since they did not matter in our research. Any other additional data mutating will be tailored specifically for the question we are answering.
+
+```{r cleaning_data, echo=FALSE, warning=FALSE}
+
+station <- read_csv("data/-External-_Bluebikes_Station_List.csv")
+
+data <- open_dataset("data/pq/", format = "parquet")
+data
+
+data_clean <- data %>%
+  filter(
+    !is.na(start_station_id),
+    !is.na(end_station_id),
+    !is.na(started_at),
+    !is.na(ended_at),
+  ) %>%
+  select(-c(ride_id))
+data_clean
+df <- data_clean |> collect()
+```
+
+
+# Exploratory Data Analysis
+## Question 1
+*How do station locations (such as population density, proximity to colleges, and nearby commercial areas) relate to BlueBikes stations running empty or full, and what can patterns in start/end-times tell us about when and where congestion occurs?*
+
+```{r q1-1 Compiling File, echo=FALSE}
+# Path to Parquet files
+parquet_path <- "data/pq"
+parquet_files <- list.files(parquet_path, pattern = "\\.parquet$", full.names = TRUE)
+
+
+# Function to add municipality columns
+add_municipality <- function(df, stations_df) {
+  df <- df |>
+    left_join(station, by = c("start_station_id" = "Number")) |>
+    rename(start_municipality = Municipality) |>
+    left_join(station, by = c("end_station_id" = "Number")) |>
+    rename(end_municipality = Municipality)
+  return(df)
+}
+
+# Initialize empty list to store all modified dfs
+df_list <- list()
+
+# Loop through all Parquet files
+for (file in parquet_files) {
+  df2 <- read_parquet(file)
+  df2 <- add_municipality(df2, station)
+  df_list[[file]] <- df2
+}
+
+# Combine all data frames into one temporary variable
+df_master <- bind_rows(df_list)
+df_master
+
+```
+Here we join each trip’s start and end stations with their municipalities and combine all files into one master dataset. The result is a single data frame where every ride includes geographic information for both its origin and destination.
+
+
+```{r q1-2_Blue Bikes in Boston, echo=FALSE}
+bluebike_stations <- st_read("data/Blue_Bike_Stations.shp", quiet = TRUE)
+boston_subdistricts <- st_read("data/Boston_Zoning_Subdistricts.shp", quiet = TRUE)
+
+selected_areas <- c("Boston Proper", "Audubon Circle Neighborhood", "Fenway Neighborhood", "Huntington Avenue/Prudential Center", "Allston/Brighton Neighborhood", "Government Center/Markets","East Boston Neighborhood","Central Artery Special","South Boston","Cambridge Street North", "Bulfinch Triangle","North End Neighborhood","Harborpark: North End Waterfront","Harborpark: Fort Point Waterfront","South End Neighborhood", "Stuart Street District","South Boston Neighborhood","Mission Hill Neighborhood","North Station Economic Development Area","New Market 21st Century Industrial District","Chinatown","Bay Village Neighborhood","Leather District")
+
+boston_subdistricts <- boston_subdistricts |> filter(Zoning_Dis %in% selected_areas)
+
+boston_subdistricts <- boston_subdistricts |> 
+  st_make_valid() |> 
+  filter(!st_is_empty(geometry))
+
+bluebike_stations |>
+st_filter(boston_subdistricts, .predicate = st_intersects) |>
+ggplot() + geom_sf(data = boston_subdistricts) + geom_sf()+   labs(
+    title = "Blue Bike Station in the City of Boston (Filtered Subdistrict)",
+    x = "Latitude",
+    y = "Longitude"
+  )
+
+
+start_counts <- df_master |>
+  filter(start_municipality == "Boston") |>
+  group_by(start_station_id, start_lat, start_lng) |>
+  summarise(count = n(), .groups = "drop")
+
+end_counts <- df_master |>
+  filter(end_municipality == "Boston") |>
+  group_by(end_station_id, end_lat, end_lng) |>
+  summarise(count = n(), .groups = "drop")
+
+```
+
+
+
+
+```{r q1-3 Comparison of start and end station for 1 year, echo=FALSE}
+end_sf <- end_counts |>
+  st_as_sf(coords = c("end_lng", "end_lat")) |>
+  st_set_crs(4326) |>
+  st_filter(boston_subdistricts)
+
+start_sf <- start_counts |>
+  st_as_sf(coords = c("start_lng", "start_lat")) |>
+  st_set_crs(4326) |>
+  st_filter(boston_subdistricts)
+
+ggplot() +
+  geom_sf(data = boston_subdistricts, fill = "grey95", color = "white") +
+
+  # Departures (start points)
+  geom_sf(
+    data = start_sf,
+    aes(color = "Departures", size = count),
+    alpha = 0.6
+  ) +
+
+  # Arrivals (end points)
+  geom_sf(
+    data = end_sf,
+    aes(color = "Arrivals", size = count),
+    alpha = 0.6
+  ) +
+
+  scale_color_manual(values = c("Departures" = "blue", "Arrivals" = "red")) +
+  scale_size(range = c(1, 6)) +
+  labs(
+    title = "BlueBikes Trips: Arrivals vs Departures",
+    color = "Type",
+    size = "Trip Count",
+        x = "Latitude",
+    y = "Longitude"
+  ) +
+  theme(legend.position = "right")
+```
+
+The spatial plot shows that arrival points generally cover larger areas of intensity compared to departure points. This indicates that many stations receive more trips ending there than starting, suggesting that certain neighborhoods act as trip destinations or “sinks” within the Bluebikes network. These areas likely correspond to workplaces, transit hubs, universities, or commercial districts where riders commonly finish their trips.
+
+However, higher arrival intensities should not be interpreted as a direct signal that these stations need more docks or additional infrastructure. Bluebikes routinely rebalances bikes across the network, which can artificially reduce or amplify the observed differences between arrivals and departures. Daily commuting patterns also contribute, with more arrivals in central employment zones and more departures in residential neighborhoods.
+
+The strong arrival intensities may also reflect riders coming from nearby municipalities such as Brookline and Cambridge-major residential areas where many students and professionals begin their trips before commuting into Boston’s job centers.
+
+Therefore, while the visual contrast between arrivals and departures helps illuminate directional flow patterns in the city, it should be viewed as a preliminary indicator rather than a standalone measure of station demand or capacity issues.
+
+
+
+
+
+
+
+
+
+
+
+
+```{r q1-4 Implementing Bike Lane to Bike Station, echo=FALSE}
+bluebike_stations <- st_read("data/Blue_Bike_Stations.shp", quiet = TRUE)
+boston_subdistricts <- st_read("data/Boston_Zoning_Subdistricts.shp", quiet = TRUE)
+bike_lanes <- st_read("data/export-trans_bike_facilities.shp", quiet = TRUE) |>
+  st_make_valid()
+
+boston_subdistricts <- st_make_valid(boston_subdistricts)
+bike_lanes <- st_make_valid(bike_lanes)
+
+st_crs(boston_subdistricts)
+st_crs(bike_lanes)
+
+bike_lanes <- st_transform(bike_lanes, st_crs(boston_subdistricts))
+
+selected_areas <- c("Boston Proper", "Audubon Circle Neighborhood", "Fenway Neighborhood", "Huntington Avenue/Prudential Center", "Allston/Brighton Neighborhood", "Government Center/Markets","East Boston Neighborhood","Central Artery Special","South Boston","Cambridge Street North", "Bulfinch Triangle","North End Neighborhood","Harborpark: North End Waterfront","Harborpark: Fort Point Waterfront","South End Neighborhood", "Stuart Street District","South Boston Neighborhood","Mission Hill Neighborhood","North Station Economic Development Area","New Market 21st Century Industrial District","Chinatown","Bay Village Neighborhood","Leather District")
+
+boston_subdistricts <- boston_subdistricts |> filter(Zoning_Dis %in% selected_areas, !st_is_empty(geometry))
+bike_lanes_boston <- bike_lanes |> filter(muni_id == 35) |> st_make_valid() |> st_filter(boston_subdistricts, .predicate = st_intersects)
+
+boston_subdistricts <- boston_subdistricts |> 
+  st_make_valid() |> 
+  filter(!st_is_empty(geometry))
+
+bluebike_stations |>
+st_filter(boston_subdistricts, .predicate = st_intersects) |>
+ggplot() + geom_sf(data = boston_subdistricts) +  geom_sf(data = bike_lanes_boston, color = "green", size = 0.7, alpha = 0.8)  + geom_sf() + labs(
+    title = "Bike Lane Overlay Blue Bike Station in the City of Boston (Filtered Subdistrict)",
+    x = "Latitude",
+    y = "Longitude"
+  )
+
+```
+
+To understand the spatial distribution of Bluebikes stations across Boston, we overlay the station locations onto the map of the city’s recognized bicycle lane facilities. From this plot, we can clearly see that most stations are situated in close proximity to existing bike lanes, which aligns with the goal of improving accessibility and safety for riders. However, a few stations appear to fall outside the immediate bike-lane network. This could indicate streets that are still bike-friendly but not formally designated as bike lanes, or areas where riders commonly travel despite lacking dedicated infrastructure.
+
+When comparing this Bluebikes station map to the earlier departure-point plot, some inconsistencies in station positions and counts become noticeable. These discrepancies may be due to data limitations or updates; such as stations being temporarily closed, relocated, or decommissioned by Bluebikes due to low usage or strategic restructuring during the study year. It's also possible that older station records remain in the dataset even though the physical docks have been removed.
+
+Overall, this overlay helps assess how well the current station network aligns with the city’s bike-lane system and highlights areas where infrastructure updates, data corrections, or additional stations may be worth exploring.
+
+
+
+
+
+
+```{r q1-5 Bivariance Plot, echo=FALSE}
+
+
+bike_lanes_boston <- bike_lanes_boston |> st_make_valid()
+
+bike_lane_density <- st_join(bike_lanes_boston, boston_subdistricts, join = st_intersects) |>
+  mutate(lane_length_m = st_length(geometry)) |>
+  st_set_geometry(NULL) |>
+  group_by(Zoning_Dis) |>
+  summarize(lane_length_m = sum(lane_length_m, na.rm = TRUE))
+
+start_activity <- st_join(start_sf, boston_subdistricts, join = st_intersects) |>
+  st_set_geometry(NULL) |>
+  group_by(Zoning_Dis) |>
+  summarize(start_trips = sum(count, na.rm = TRUE))
+
+end_activity <- st_join(end_sf, boston_subdistricts, join = st_intersects) |>
+  st_set_geometry(NULL) |>
+  group_by(Zoning_Dis) |>
+  summarize(end_trips = sum(count, na.rm = TRUE))
+
+trip_activity <- start_activity |>
+  left_join(end_activity, by = "Zoning_Dis") |>
+  mutate(total_trips = rowSums(across(c(start_trips, end_trips)), na.rm = TRUE))
+
+boston_metrics <- boston_subdistricts |>
+  left_join(bike_lane_density, by = "Zoning_Dis") |>
+  left_join(trip_activity, by = "Zoning_Dis") |>
+  mutate(
+    lane_length_m = ifelse(is.na(lane_length_m), 0, lane_length_m),
+    total_trips = ifelse(is.na(total_trips), 0, total_trips)
+  )
+
+boston_metrics <- boston_metrics |>
+  st_make_valid() |>
+  filter(!st_is_empty(geometry))
+
+
+boston_metrics_bi <- bi_class(
+  boston_metrics,
+  x = lane_length_m,     
+  y = total_trips,        
+  style = "quantile",     
+  dim = 3                 
+)
+
+
+bi_map <- ggplot() +
+  geom_sf(
+    data = boston_metrics_bi,
+    aes(fill = bi_class),
+    color = "white",
+    size = 0.2
+  ) +
+  bi_scale_fill(pal = "DkBlue", dim = 3) +  
+  labs(
+    title = "Bivariate Map: Bike Lane Length vs Total Trips",
+     x = "Latitude",
+    y = "Longitude"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+
+bi_legend <- bi_legend(
+  pal = "DkBlue",
+  dim = 3,
+  xlab = "Lane Length →",
+  ylab = "Trips ↑"
+)
+
+
+final_plot <- ggdraw() +
+  draw_plot(bi_map, 0, 0, 1, 1) +
+  draw_plot(bi_legend, 0.7, 0.05, 0.25, 0.25) 
+
+final_plot
+
+```
+
+The bivariate map is a useful tool for visualizing the relationship between two variables-in this case, the bike-lane length within each Boston subdistrict and the total number of Bluebikes trips originating or ending there. While this method helps reveal spatial patterns, it is also somewhat imprecise, since lane length alone does not fully capture the quality, connectivity, or actual usability of the bike network. Longer lane segments may include low-traffic side streets, disconnected paths, or lanes that riders do not frequently choose.
+
+Despite these limitations, the bivariate map in this study shows a clear pattern: subdistricts with longer bike-lane networks tend to have higher Bluebikes trip volumes. This suggests that improved cycling infrastructure is associated with greater system usage, supporting the idea that accessibility and safety encourage more riders.
+
+However, it is important to account for geographic differences. Some subdistricts naturally require more lane length because they cover larger land areas, include more major roads, or have unique physical or urban constraints. These structural characteristics influence both how much bike infrastructure can be built and how many trips the area can support.
+
+Overall, while the bivariate map provides a helpful preliminary visualization of the relationship between lane length and trip frequency, it should be complemented with more precise modeling; such as spatial regression-to fully understand how bike infrastructure influences Bluebikes usage.
+
+
+## Question 2
+*How seasonal trends affect the system, such as expected winter drops or summer peaks*
+
+```{r q2-1, echo=FALSE}
+
+question2 <- df %>%
+  mutate(
+    started_at = as_datetime(started_at),
+    ended_at   = as_datetime(ended_at),
+    trip_duration_min = as.numeric(difftime(ended_at, started_at, units = "mins")),
+    trip_date  = as_date(started_at),
+    trip_hour  = hour(started_at),
+    trip_month = month(started_at, label = TRUE, abbr = TRUE),
+    trip_wday  = wday(started_at, label = TRUE)
+  ) %>%
+  filter(
+    !is.na(trip_duration_min),
+    trip_duration_min > 0,
+    trip_duration_min < 240
+  ) 
+
+question2 %>%
+  count(trip_month) %>%
+  ggplot(aes(x = trip_month, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Total BlueBikes Trips by Month",
+       x = "Month", y = "Number of Trips")
+
+
+
+
+```
+
+The bar plot shows strong seasonal variation in BlueBikes usage over the year. Usage is lowest in the winter months (December–Feb), increases steadily through the spring, and stays high throughout the summer (June–August). This pattern is expected because biking is more appealing and practical in warmer weather.
+
+Trips peak sharply in September and October, which likely reflects a combination of:
+
+-   returning university students (BU, Northeastern, MIT, Harvard)
+
+-   good weather (not too hot, not too cold)
+
+-   commuter activity increasing after summer vacations
+
+After October, trip counts drop again moving into November and December as temperatures fall.
+
+```{r q2-2, echo=FALSE}
+
+names(station)
+names(question2)
+
+question2 <- question2 %>%
+  left_join(station, 
+            by = c("start_station_name" = "NAME"))
+
+
+
+```
+Just checking our column names and joining station data to get municipality info for each trip's start station.
+
+```{r q2-3, echo=FALSE}
+
+if("start_municipality" %in% names(question2)){
+  question2 <- question2 %>% select(-start_municipality)
+}
+
+question2 <- question2 %>%
+  rename(start_municipality = Municipality)
+
+```
+
+```{r, fig.width=12, fig.height=4}
+
+p_all <- question2 %>%
+  count(trip_month) %>%
+  ggplot(aes(x = trip_month, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Total BlueBikes Trips by Month",
+    x = "Month", y = "Number of Trips"
+  )
+
+p_boston <- question2 %>%
+  filter(!is.na(start_municipality),
+         start_municipality == "Boston") %>%
+  count(trip_month) %>%
+  ggplot(aes(x = trip_month, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "BlueBikes Trips from Boston Stations by Month",
+    x = "Month", y = "Number of Trips"
+  )
+
+p_all | p_boston
+
+
+```
+
+Placing these plots side by side shows that trips starting at Boston stations follow the same seasonal pattern as overall system usage, with low activity in winter and peaks in late summer and early fall. While total trip counts are lower for Boston-only stations, the timing of increases and declines is closely aligned, suggesting that city stations primarily drive the system’s seasonal trends.
+
+
+```{r q2_lineplot, echo=FALSE}
+question2 %>%
+  group_by(trip_month, member_casual) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = trip_month, y = trips, color = member_casual, group = member_casual)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  labs(
+    title = "Monthly Trips by Rider Type",
+    x = "Month",
+    y = "Number of Trips",
+    color = "Rider Type"
+  ) +
+  theme_minimal()
+
+
+question2 %>%
+  mutate(season = case_when(
+    trip_month %in% c("Dec", "Jan", "Feb") ~ "Winter",
+    trip_month %in% c("Mar", "Apr", "May") ~ "Spring",
+    trip_month %in% c("Jun", "Jul", "Aug") ~ "Summer",
+    TRUE ~ "Fall"
+  )) %>%
+  group_by(season, trip_hour) %>%
+  summarise(trips = n(), .groups = "drop") %>%
+  ggplot(aes(x = trip_hour, y = trips, color = season)) +
+  geom_line() +
+  labs(
+    title = "Trips by Hour of Day Across Seasons",
+    x = "Hour of Day",
+    y = "Number of Trips",
+    color = "Season"
+  ) +
+  theme_minimal() 
+```
+
+Members make more trips than casual riders in every month, though both groups follow similar seasonal patterns. Interesting to note however, is that September sees an increase in trips among member users, while casual users peak in the summer months of June and July. This suggests that members may be more influenced by the academic calendar, while casual riders are more driven by leisure and tourism during summer; casual users see a dip in trip being made starting in September. At any given month, member users constantly make more trips than casual users by a large margin. 
+
+Across seasons, trips peak during daytime hours, with the strongest and longest activity windows occurring in summer and fall. Also important to note is that trips across all 4 seasons seem to peak at around 8am, and then again 5pm. The morning peak likely reflects commuting trips, such as riders traveling to work, school, or transit hubs. The larger afternoon/early-evening peak is consistent with return commutes; the even greater average number of trips than morning can attributed to people riding bikes for social or recreational travel after work/school/business throughout the day.
+
+
+## Question 3
+*How distance and trip duration relate, especially because BlueBikes charges overtime fees after a threshold; stations with many long-duration trips may indicate gaps where an intermediate station could reduce overage charges.*
+
+```{r q3_gaps, echo=FALSE}
+# we're just going to calculate the coordinate distance away from start and end to use as distance
+# actually finding the route would take too long
+
+# run this in console to get geosphere
+# install.packages('geosphere', repos='https://rspatial.r-universe.dev')
+library(geosphere)
+
+trips_subset <- data_clean |> 
+  select(
+    started_at, ended_at,
+    start_lat, start_lng,
+    end_lat, end_lng,
+    member_casual,
+    start_station_name, end_station_name
+  ) |>
+  filter(!is.na(start_lat) & !is.na(end_lat)) |>
+  collect()
+
+trips_processed <- trips_subset |>
+  mutate(
+    duration_min = as.numeric(difftime(ended_at, started_at, units = "mins")),  # duration to minutes
+    dist_km = distHaversine(
+      p1 = cbind(start_lng, start_lat),
+      p2 = cbind(end_lng, end_lat)
+    ) / 1000
+  )
+```
+
+```{r q3_overtimeplot, echo=FALSE}
+library(ggplot2)
+library(scales) 
+
+overtime_by_distance <- trips_processed |>
+  filter(start_station_name != end_station_name) |>
+  mutate(
+    limit = ifelse(member_casual == "member", 45, 30),
+    is_overage = duration_min > limit,
+    
+    # create the cut
+    dist_cut = cut(dist_km, 
+                   breaks = seq(0, 10, by = 1), 
+                   include.lowest = TRUE, 
+                   right = FALSE),
+    
+    # clean the labels: remove brackets and commas
+    dist_label = stringr::str_replace_all(dist_cut, "[\\(\\[\\]\\)]", "") |>
+                 stringr::str_replace(",", "-")
+  ) |>
+  # we need to re-order the factor based on the numeric value, not alphabetical
+  mutate(dist_label = reorder(dist_label, dist_km)) |>
+  
+  group_by(dist_label) |>
+  summarise(
+    overtime_rate = mean(is_overage, na.rm = TRUE),
+    total_trips = n(),
+    .groups = "drop"
+  ) |>
+  filter(!is.na(dist_label))
+
+plot
+ggplot(overtime_by_distance, aes(x = dist_label, y = overtime_rate)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Proportion of Trips Incurring Overage Fees by Distance",
+    subtitle = "Analysis of non-round trips only",
+    x = "Distance Range (km)", # Fixed label
+    y = "Percentage of Trips with Overages"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Between 1 and 3 km, the overage rate is minimal (\<5%), suggesting that most trips within this distance are completed within the time limit. However, starting from 3 km, the overage rate begins to rise noticeably, reaching around 15% at 4-5 km and climbing to nearly 30% for trips between 7-8 km. This indicates that longer trips are more likely to exceed the time limit, leading to additional fees.\
+We should also point out trips below 1 km have a slightly higher overage rate than 1-3 km trips. This could be due to short-distance trips where riders take longer routes or due to station capacity limits, leading to exceeding the time limit despite the short distance.
+
+```{r q3_truegap, echo=FALSE}
+gap_candidates <- trips_processed |>
+  mutate(
+    overage_threshold = ifelse(member_casual == "member", 45, 30),
+    is_overage = duration_min > overage_threshold
+  )  |>
+  filter(is_overage == TRUE)  |>
+  filter(dist_km < 3)  |>  # short distance but long time
+  group_by(start_station_name, end_station_name)  |>
+  summarise(
+    count = n(),
+    avg_mins = mean(duration_min),
+    avg_km = mean(dist_km),
+    .groups = "drop"
+  )  |>
+  arrange(desc(count))
+
+print(slice_head(gap_candidates, n = 20))
+
+# gap_candidates has a lot of station pairs where start = end meaning that people are just circling around
+# so the Haversine dist is actually close to 0
+# does tell us that people are willing to pay overtime fees to ride around for fun though
+# esp when we look at the actual stations and realize that they're popular cycling places
+
+# let's try to exclude these round trips now
+true_gaps <- gap_candidates |> 
+  filter(start_station_name != end_station_name)
+
+print(slice_head(true_gaps, n = 20))
+
+
+# helper function to clean names
+clean_name <- function(x) {
+  x |> 
+    str_remove(" at .*") |>      # Remove ' at X St'
+    str_remove(" / .*") |>       # Remove ' / Y St'
+    str_remove(" - .*") |>       # Remove ' - Landmark'
+    str_trunc(25)                # Cap at 25 chars
+}
+
+real_commute_gaps <- true_gaps |>
+  mutate(effective_speed_kph = avg_km / (avg_mins / 60)) |> # calc "Effective Speed" (Straight-line Distance / Total Time)
+  filter(effective_speed_kph > 3) |>  # remove "Joyrides" / "Loiterers" (< 3 km/h)
+  filter(avg_km > 1.0) |> # focus on meaningful distances (> 1 km)
+  mutate(
+    expected_mins = (avg_km / 12) * 60 # expected time (assuming 12 km/h bike speed)
+  ) |>
+  arrange(desc(count)) |>
+  head(15)
+
+# process w clean names
+plot_data <- real_commute_gaps |>
+  mutate(
+    route_label = paste0(clean_name(start_station_name), " → ", clean_name(end_station_name))
+  ) |>
+  arrange(desc(count)) |>
+  mutate(route_label = factor(route_label, levels = rev(route_label)))
+
+# plot
+ggplot(plot_data) +
+  geom_segment(aes(y = route_label, yend = route_label, 
+                   x = expected_mins, xend = avg_mins), 
+               color = "grey70", linewidth = 1.2) +
+  geom_point(aes(y = route_label, x = expected_mins), 
+             color = "#28a745", size = 4) +
+  
+  geom_point(aes(y = route_label, x = avg_mins), 
+             color = "#dc3545", size = 4) +
+  labs(
+    title = "Expected vs. Actual Commute Times",
+    subtitle = "Top 15 High-Traffic Routes",
+    x = "Trip Duration (Minutes)",
+    y = NULL,
+    caption = "Green = Expected | Red = Actual"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 10, color = "black"),
+    panel.grid.major.y = element_blank()
+  )
+
+```
+
+Looking at the plot, we see that out of the 15 problem routes, 10 of them are trips between Harvard University locations and MIT. This suggests that the single most inefficient commuter corridor in the entire BlueBikes network (after filtering) is the stretch of Massachusetts Ave connecting these two universities. The expected trip duration all hover between 10 and 15 minutes, suggesting that the physical distance is short and direct (around 2-3km). However, the actual durations hover around 45 to 55 minutes, which are about 3x longer than what the physical distance implies. 
+
+This might be due to a docking availability problem where students ride to Harvard/MIT stations and find no available docks, forcing them to ride further to find an open station. A possible solution for this "inefficiency" could be to add more docks at these high-traffic stations.
+
+Users can request an additional 15 minutes at the kiosk of stations if the docks are full, which stops overcharge fees from accruing. However, this only helps if users are aware of this option and willing to take the extra time to find an open dock.
+
+One interesting outlier was from Mugar Way to Silber Way which is along the Charles River Esplanade. This delay (45 mins vs 12 expected) could suggest that users recreationally riding along the river path, rather than commuting. Another outlier is from Bike Town to Murphy Skating Rink, which could also be a recreational beach riding trip rather than a commute. 
+
+
+```{r q3_isolation, echo=FALSE}
+# 1. Calculate Isolation Metrics
+station_isolation <- trips_processed |>
+  # Filter out round trips (we care about A -> B connectivity)
+  filter(start_station_name != end_station_name) |>
+  
+  group_by(start_station_name) |>
+  summarise(
+    median_duration = median(duration_min, na.rm = TRUE),
+    avg_dist = mean(dist_km, na.rm = TRUE),
+    trip_count = n()
+  ) |>
+  
+  # Filter for relevant stations (ignore tiny ones with < 50 trips)
+  filter(trip_count > 50) |>
+  
+  # Sort: Most isolated (longest median trip) at the top
+  arrange(desc(median_duration))
+
+# 2. Visualize the "Top 20 Isolated Stations"
+top_isolated <- head(station_isolation, 20)
+
+ggplot(top_isolated, aes(x = reorder(str_trunc(start_station_name, 25), median_duration), 
+                         y = median_duration)) +
+  geom_col(fill = "steelblue") +
+  
+  # Add the "Efficiency Check" (Distance) as text on the bar
+  geom_text(aes(label = paste0(round(avg_dist, 1), " km")), 
+            hjust = 1.2, color = "black", size = 3) +
+  
+  coord_flip() +
+  labs(
+    title = "The 'Lonely Islands': Most Isolated BlueBike Stations",
+    subtitle = "Stations with the longest median travel times to reach a destination",
+    x = NULL,
+    y = "Median Trip Duration (Minutes)",
+    caption = "Labels show average distance traveled"
+  ) +
+  theme_minimal()
+```
+
+The graph above shows the 20 most isolated BlueBike stations based on median trip duration after departing. The longer the median trip time, the more "isolated" the station is considered. The median trip duration for a bike leaving Auburndale and Northern Strand are 30+ minutes for 6.3 km and 5.8 km, respectfully. This suggests that these stations are poorly connected to the rest of the BlueBike network, requiring long rides to reach other stations. A suggestion for BlueBikes would be to add intermediate stations roughly 2-3 km away from these outlier stations, so people have the choice of taking shorter trips rather than long rides.
+
+
+
+
+
+# Modeling and Inference
+## Question 1
+```{r q1 - Modelling 1, echo=FALSE, warning=FALSE}
+
+
+
+# Ensure boston_metrics is valid
+boston_metrics <- st_make_valid(boston_metrics)
+
+# SIMPLE OLS LINEAR REGRESSION MODEL
+model_ols <- lm(total_trips ~ lane_length_m, data = boston_metrics)
+summary(model_ols)
+
+# Plot regression relationship
+plot(boston_metrics$lane_length_m, boston_metrics$total_trips,
+     pch = 19, col = "blue",
+     xlab = "Bike Lane Length (m)",
+     ylab = "Total BlueBike Trips",
+     main = "OLS Relationship: Bike Lanes vs BlueBike Trips (in each subdistrict)")
+
+abline(model_ols, col = "red", lwd = 2)
+
+
+
+# Spatial Neighborhoods structure
+
+# Create neighbors list based on polygon touching
+nb <- poly2nb(boston_metrics)
+
+# Convert neighbor structure to spatial weight
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# MORAN’S I — TEST FOR SPATIAL CLUSTERING
+moran_trips  <- moran.test(boston_metrics$total_trips, lw)
+moran_lanes  <- moran.test(boston_metrics$lane_length_m, lw)
+
+print(moran_trips)
+print(moran_lanes)
+
+
+
+# Spatial lag model
+spatial_lag_model <- lagsarlm(
+  total_trips ~ lane_length_m,
+  data = boston_metrics,
+  lw,
+  zero.policy = TRUE
+)
+
+summary(spatial_lag_model)
+
+
+```
+
+The statistical results indicate a strong and significant relationship between bicycle lane length and the number of BlueBike trips across Boston subdistricts. The OLS regression shows that lane length is a positive predictor of ridership (Estimated at 9.59, p-value < 2e-16), meaning that for every additional meter of bicycle lane, the model predicts roughly 9-10 more annual trips. The model explains about 42% of the variation in trip counts (R-squared estimated at 0.43), suggesting a moderate but meaningful association. However, the very high and significant Moran’s I values for both total trips (I estimated at 0.68) and lane length (I estimated at 0.93) indicate strong spatial autocorrelation, meaning that subdistricts with high values tend to cluster together geographically. This violates the independence assumption of OLS and suggests that spatial processes influence ridership patterns.
+
+After accounting for spatial dependence using a spatial lag model, the relationship between lane length and trips remains strongly significant, though the effect size decreases (Estimated at 4.36). The spatial lag coefficient (rho is estimated at 0.70, p-value < 2.2e-16) indicates that nearby subdistricts have a substantial influence on each other's ridership levels. This means that areas adjacent to high-usage zones are likely to also have higher trip volumes, independent of lane length alone. The spatial model provides a better fit (AIC 18882 vs. 19281 for OLS), confirming that spatial effects are essential to explaining trip distribution. Overall, the analysis shows that longer bicycle lane networks are associated with higher BlueBike usage, but ridership patterns are also strongly shaped by spatial clustering, neighboring infrastructure, and broader geographic context.
+
+The linear regression model shows a strong and statistically significant relationship between bike lane length and total BlueBike trips. The slope of 9.59 (p < 2e-16) indicates that, on average, each additional meter of bike lane is associated with roughly 9-10 more trips. The model explains about 42.6% of the variation in trip counts (R-squared = 0.426), suggesting that lane length accounts for a meaningful portion of ridership but that other factors; such as population density, station placement, and spatial clustering; also play important roles. The residual standard error is relatively large, indicating considerable variability around the fitted line, so while the positive relationship is clear, the linear fit does not capture all the complexity in the data. Overall, the model is valid and interpretable, but additional modeling or transformations could improve fit and account for nonlinearity or spatial effects.
+
+
+```{r q1 - Modelling 2, echo = FALSE, warning=FALSE}
+boston_metrics$log_lane_length <- log(boston_metrics$lane_length_m)
+model_log <- lm(total_trips ~ log_lane_length, data = boston_metrics)
+summary(model_log)
+
+
+plot(boston_metrics$lane_length_m, boston_metrics$total_trips,
+     pch = 19, col = "blue",
+     xlab = "Bike Lane Length (m)",
+     ylab = "Total BlueBike Trips",
+     main = "Log–Linear Fit: log(X) vs Trips",
+     log = "x")
+
+# Add fitted line on log-scale
+xvals <- seq(min(boston_metrics$lane_length_m),
+             max(boston_metrics$lane_length_m),
+             length.out = 100)
+
+preds <- predict(model_log, newdata = data.frame(log_lane_length = log(xvals)))
+
+lines(xvals, preds, col = "red", lwd = 2)
+
+```
+
+The log-transformed linear model shows a strong, significant positive relationship between bike lane length and total BlueBike trips. The slope indicates that proportional increases in lane length lead to substantial increases in trips, though the intercept is not directly meaningful. The model explains about 43% of the variation in trips, suggesting a moderate fit, while the residuals indicate that other factors; like station placement or neighborhood characteristics; also influence ridership. Overall, logging lane length helps account for skew and confirms that longer bike lanes are associated with higher usage.
+
+
+
+```{r q1 - modelling 3, echo=FALSE, warning=FALSE}
+
+# Filter out zero or negative lane lengths
+boston_metrics_filtered <- boston_metrics %>% filter(lane_length_m > 0)
+
+# Create log of x for easier fitting
+boston_metrics_filtered <- boston_metrics_filtered %>%
+  mutate(log_lane = log(lane_length_m))
+
+# Non-linear model: y = a * (log(x))^b
+model_curve <- nls(total_trips ~ a * log_lane^b,
+                   data = boston_metrics_filtered,
+                   start = list(a = 1000, b = 1))
+
+summary(model_curve)
+
+# Add predicted values
+boston_metrics_filtered <- boston_metrics_filtered %>%
+  mutate(pred_curve = predict(model_curve))
+
+# Plot the curve fit
+ggplot(boston_metrics_filtered, aes(x = lane_length_m, y = total_trips)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_line(aes(y = pred_curve), color = "red", size = 1) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    title = "Non-linear Curve Fit: Total Trips vs Log(Bike Lane Length)",
+    x = "Bike Lane Length (m, log scale)",
+    y = "Total BlueBike Trips"
+  ) +
+  theme_minimal()
+
+# Residual plot
+ggplot(boston_metrics_filtered, aes(x = lane_length_m, y = total_trips - pred_curve)) +
+  geom_point(color = "purple", size =2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    title = "Residuals of Non-linear Curve Fit",
+    x = "Bike Lane Length (m, log scale)",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+
+```
+The nonlinear model suggests that BlueBike trips increase in a nonlinear fashion with bike lane length. The exponent parameter b = 5.12 is highly significant, indicating a steep increase in trips as lane length grows, while the scaling factor a=3.21 is not statistically significant. The residual standard error is slightly lower than in the linear models, and the model explains a substantial proportion of the variance in trip counts, indicating a strong fit. Overall, this curve implies that longer bike lanes are associated with disproportionately higher usage, reflecting a strong nonlinear effect of infrastructure on ridership.
+
+
+## Question 3
+
+```{r q3_overtimeplot - modelling 1, echo=FALSE, warning=FALSE}
+# Create numeric midpoint for each distance bin
+overtime_lm_data <- overtime_by_distance |>
+  mutate(
+    dist_mid = sapply(strsplit(as.character(dist_label), "-"),
+                      function(x) mean(as.numeric(x)))
+  )
+
+# Fit linear model
+model_overage <- lm(overtime_rate ~ dist_mid, data = overtime_lm_data)
+
+overtime_lm_data$residuals <- resid(model_overage)
+overtime_lm_data$predicted <- predict(model_overage)
+
+# Show model output
+summary(model_overage)
+
+
+# Build the linear plot
+ggplot(overtime_lm_data, aes(x = dist_mid, y = overtime_rate)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Linear Relationship Between Distance and Overage Rate",
+    x = "Distance (km, midpoint of range)",
+    y = "Overage Rate (%)"
+  ) +
+  theme_minimal()
+```
+
+
+The linear model examining the relationship between trip distance and the proportion of trips incurring overage fees shows a strong positive association. The slope coefficient for distance (dist_mid) is 0.049, highly significant (p < 0.001), indicating that as trip distance increases by 1 km, the overage rate increases by roughly 4.9 percentage points. The intercept is slightly negative but marginally insignificant (p estimated at 0.057). The model explains a very large portion of the variation in overage rates, with an R-squared of 0.94, suggesting an excellent fit. Overall, the results indicate that longer trips are strongly associated with a higher likelihood of exceeding the allowed time limit.
+
+
+
+
+
+
+
+```{r q3_overtimeplot - modelling 2, echo=FALSE}
+# Compute residuals
+overtime_lm_data <- overtime_lm_data %>%
+  mutate(pred = predict(model_overage),
+         residual = overtime_rate - pred)
+
+# Residual plot (horizontal zero line)
+ggplot(overtime_lm_data, aes(x = dist_mid, y = residual)) +
+  geom_point(size = 3, alpha = 0.6) +
+  geom_segment(aes(x = dist_mid, xend = dist_mid, y = 0, yend = residual),
+               linetype = "dashed", color = "black",size = 1) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "red",size = 1) +
+  labs(
+    title = "Residuals vs Distance",
+    x = "Distance (km, midpoint)",
+    y = "Residual (Observed – Predicted)"
+  ) +
+  theme_minimal()
+
+# Add vertical lines from points to regression line
+ggplot(overtime_lm_data, aes(x = dist_mid, y = overtime_rate)) +
+  geom_point(size = 3, alpha = 0.6) +
+  geom_line(aes(y = pred), color = "red", size = 1) +
+  geom_segment(aes(xend = dist_mid, yend = pred), color = "black", linetype = "dashed",size = 0.5) +
+  labs(
+    title = "Points vs Fitted Line with Vertical Residuals",
+    x = "Distance (km, midpoint)",
+    y = "Overage Rate"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+
+## Question 4
+*Whether there is a correlation between membership type (member vs. casual) and bike type (classic vs. electric).*
+
+```{r q4, echo=FALSE}
+# simple plot
+plot_data <- data_clean |> 
+  select(member_casual, rideable_type) |>
+  group_by(member_casual, rideable_type) |>
+  summarise(total_trips = n()) |>
+  collect()
+
+plot_data |> ggplot(aes(x = member_casual, y = total_trips, fill = rideable_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Trip Counts by Membership Type and Bike Type",
+       x = "Membership Type", y = "Total Trips") +
+  scale_fill_manual(values = c("classic_bike" = "lightblue", "electric_bike" = "orange")) +
+  theme_minimal()
+
+# contingency table
+contingency_table <- data_clean |> 
+  select(member_casual, rideable_type) |>
+  group_by(member_casual, rideable_type) |>
+  summarise(total_trips = n()) |>
+  collect() |>
+  pivot_wider(names_from = rideable_type, values_from = total_trips, values_fill = 0)
+print(contingency_table)
+
+# chi-squared test
+contingency_matrix <- contingency_table |> 
+  tibble::column_to_rownames(var = "member_casual") |>
+  as.matrix()
+chi_square_test <- chisq.test(contingency_matrix)
+print(chi_square_test)
+
+# cramer's V
+# Calculate association statistics, including Cramér's V
+association_stats <- assocstats(contingency_matrix)
+# Print the association statistics
+print(association_stats)
+```
+
+The p-value from the chi-squared test is very small (p \< 0.001), indicating a significant correlation between membership type and bike type. However, the Cramer's V value is 0.05 which indicates a weak association. This means we might have to look at other factors that can influence bike type choice beyond membership status.
+
+
+
+
+
+# Conclusion
+
+Overall, our analysis shows that BlueBikes usage patterns across Boston are highly structured in space and time, with demand concentrating around dense urban corridors, major institutions, and predictable commute periods. These recurring patterns suggest that while the system is generally well-aligned with the city’s travel needs, certain locations experience sustained pressure.
+
+Although BlueBikes actively rebalances bikes across stations, our results indicate that rebalancing alone does not always resolve these pressures. In several high-demand corridors and destination-heavy areas, trips are consistently longer than expected given their physical distance, pointing to limitations in dock capacity and network connectivity rather than temporary bike shortages.
+
+Taken together, these findings suggest that targeted interventions—such as increasing dock capacity at major destination stations, refining rebalancing schedules during peak hours, and adding intermediate stations in poorly connected areas—would be more effective than broad system-wide changes. Our study demonstrates how combining trip data with spatial analysis can support focused, data-driven improvements to bike-share infrastructure.
